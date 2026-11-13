@@ -1,4 +1,4 @@
-import { Product, Coupon } from './types';
+import { Product, Coupon, User } from './types';
 
 export const PRODUCTS: Product[] = [
   {
@@ -124,6 +124,8 @@ export const COUPONS: Coupon[] = [
   { code: 'NEWUSER', discount: 15, minOrder: 200000 },
 ];
 
+export const FREESHIP_COUPON = { code: 'FREESHIP', minOrder: 0 };
+
 export const FREE_SHIPPING_THRESHOLD = 500000;
 
 export const SHIPPING_FEE_MAP: Record<string, number> = {
@@ -143,6 +145,26 @@ export const ADMIN_ACCOUNT = {
   isLocked: false,
 };
 
+export const DEFAULT_CUSTOMER_ACCOUNTS: User[] = [
+  {
+    id: 'customer-001',
+    name: 'Nguyễn Văn Test',
+    email: 'khach1@cocoon.vn',
+    phone: '',
+    password: 'Khach123456',
+    role: 'user',
+    isLocked: false,
+  },
+  {
+    id: 'customer-002',
+    name: 'Trần Thị Test',
+    email: 'khach2@cocoon.vn',
+    phone: '',
+    password: 'Khach654321',
+    role: 'user',
+    isLocked: false,
+  },
+];
 export const CATEGORIES = ['Chăm sóc da', 'Chăm sóc tóc', 'Chăm sóc cơ thể', 'Chăm sóc môi'];
 
 export function formatPrice(price: number): string {

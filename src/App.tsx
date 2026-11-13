@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Product, CartItem, User, Order } from './types';
-import { PRODUCTS, COUPONS, FREE_SHIPPING_THRESHOLD, SHIPPING_FEE_MAP, ADMIN_ACCOUNT, CATEGORIES, formatPrice } from './data';
+import { PRODUCTS, COUPONS, FREESHIP_COUPON, FREE_SHIPPING_THRESHOLD, SHIPPING_FEE_MAP, ADMIN_ACCOUNT, DEFAULT_CUSTOMER_ACCOUNTS, CATEGORIES, formatPrice } from './data';
 import SeleniumGuide from './SeleniumGuide';
 
 // Helper functions for localStorage
@@ -17,33 +17,67 @@ function saveToStorage<T>(key: string, value: T): void {
   localStorage.setItem(key, JSON.stringify(value));
 }
 
-// Initialize admin account & migrate data
-function initAdmin() {
+// Initialize built-in accounts and migrate legacy users before React state is created.
+// This prevents the initial empty users state from overwriting localStorage.
+function initializeUsers(): User[] {
   const users = getFromStorage<User[]>('cocoon_users', []);
-  // Migrate: add isLocked field for old users
-  let needsSave = false;
-  const migrated = users.map(u => {
-    if (u.isLocked === undefined) {
-      needsSave = true;
-      return { ...u, isLocked: false };
+  let changed = false;
+  const migrated = users.map(user => {
+    if (user.isLocked === undefined) {
+      changed = true;
+      return { ...user, isLocked: false };
     }
-    return u;
+    return user;
   });
-  // Add admin if not exists
-  if (!migrated.find(u => u.id === ADMIN_ACCOUNT.id)) {
-    migrated.push(ADMIN_ACCOUNT);
-    needsSave = true;
+
+  const defaults: User[] = [ADMIN_ACCOUNT, ...DEFAULT_CUSTOMER_ACCOUNTS];
+  for (const account of defaults) {
+    const exists = migrated.some(user =>
+      user.id === account.id || user.email.toLowerCase() === account.email.toLowerCase()
+    );
+    if (!exists) {
+      migrated.push(account);
+      changed = true;
+    }
   }
-  if (needsSave) {
+
+  if (changed || localStorage.getItem('cocoon_users') === null) {
     saveToStorage('cocoon_users', migrated);
   }
+  return migrated;
+}
+// Keep the checkout display and the saved order totals consistent.
+function calculateCheckoutTotals(cartTotal: number, address: string, couponCode: string, shippingCode: string = '') {
+  const code = couponCode.trim().toUpperCase();
+  const normalizedShippingCode = shippingCode.trim().toUpperCase();
+  const coupon = COUPONS.find(c => c.code === code);
+  const freeShipping = normalizedShippingCode === FREESHIP_COUPON.code && cartTotal > 0 && cartTotal >= FREESHIP_COUPON.minOrder;
+  const validCoupon = coupon && cartTotal > 0 && cartTotal >= coupon.minOrder ? coupon : null;
+  const couponDiscount = validCoupon ? Math.round(cartTotal * validCoupon.discount / 100) : 0;
+  const addressLower = address.toLowerCase();
+  let shippingFee = SHIPPING_FEE_MAP['default'];
+  if (addressLower.includes('hcm') || addressLower.includes('hồ chí minh') || addressLower.includes('sài gòn')) {
+    shippingFee = SHIPPING_FEE_MAP['hcm'];
+  } else if (addressLower.includes('hà nội') || addressLower.includes('hn')) {
+    shippingFee = SHIPPING_FEE_MAP['hn'];
+  } else if (addressLower.includes('đà nẵng') || addressLower.includes('danang')) {
+    shippingFee = SHIPPING_FEE_MAP['danang'];
+  }
+  if (cartTotal >= FREE_SHIPPING_THRESHOLD || freeShipping) shippingFee = 0;
+  return {
+    shippingFee,
+    couponDiscount,
+    finalTotal: Math.max(0, cartTotal - couponDiscount + shippingFee),
+    appliedCouponCode: validCoupon ? code : '',
+    appliedShippingCode: freeShipping ? normalizedShippingCode : '',
+  };
 }
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [cart, setCart] = useState<CartItem[]>([]);
-  const [orders, setOrders] = useState<Order[]>([]);
-  const [users, setUsers] = useState<User[]>([]);
+  const [currentUser, setCurrentUser] = useState<User | null>(() => getFromStorage('cocoon_current_user', null));
+  const [cart, setCart] = useState<CartItem[]>(() => getFromStorage('cocoon_cart', []));
+  const [orders, setOrders] = useState<Order[]>(() => getFromStorage('cocoon_orders', []));
+  const [users, setUsers] = useState<User[]>(initializeUsers);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeCategory, setActiveCategory] = useState('Tất cả');
   const [showAuthModal, setShowAuthModal] = useState(false);
@@ -56,22 +90,13 @@ export default function App() {
   const [showProductDetail, setShowProductDetail] = useState<Product | null>(null);
   const [toast, setToast] = useState<{ message: string; type: string } | null>(null);
   const [currentPage, setCurrentPage] = useState<'home' | 'checkout' | 'order-history' | 'admin' | 'profile' | 'selenium-guide'>('home');
-  const [products, setProducts] = useState<Product[]>(PRODUCTS);
-
-  // Load data on mount
-  useEffect(() => {
-    initAdmin();
-    const savedUser = getFromStorage<User | null>('cocoon_current_user', null);
-    const savedCart = getFromStorage<CartItem[]>('cocoon_cart', []);
-    const savedOrders = getFromStorage<Order[]>('cocoon_orders', []);
-    const savedUsers = getFromStorage<User[]>('cocoon_users', []);
-    const savedProducts = getFromStorage<Product[] | null>('cocoon_products', null);
-    setCurrentUser(savedUser);
-    setCart(savedCart);
-    setOrders(savedOrders);
-    setUsers(savedUsers);
-    if (savedProducts) setProducts(savedProducts);
-  }, []);
+  const [products, setProducts] = useState<Product[]>(() => getFromStorage('cocoon_products', PRODUCTS));
+  const [sortBy, setSortBy] = useState('featured');
+  const [onlyAvailable, setOnlyAvailable] = useState(false);
+  const [onlyOffers, setOnlyOffers] = useState(false);
+  const [infoPanel, setInfoPanel] = useState<string | null>(null);
+  const orderInProgress = useRef(false);
+  const goToCatalog = () => { setCurrentPage('home'); setTimeout(() => document.getElementById('catalog')?.scrollIntoView({ behavior: 'smooth' }), 0); };
 
   // Save data on change
   useEffect(() => { saveToStorage('cocoon_current_user', currentUser); }, [currentUser]);
@@ -85,20 +110,35 @@ export default function App() {
     setTimeout(() => setToast(null), 3000);
   }, []);
 
+  useEffect(() => {
+    const open = showAuthModal || showCart || !!showProductDetail || !!infoPanel;
+    if (!open) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const close = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setShowAuthModal(false); setShowCart(false); setShowProductDetail(null); setInfoPanel(null); }
+    };
+    window.addEventListener('keydown', close);
+    return () => { document.body.style.overflow = previous; window.removeEventListener('keydown', close); };
+  }, [showAuthModal, showCart, showProductDetail, infoPanel]);
+
   // Filter products
   const filteredProducts = products.filter(p => {
     const matchCategory = activeCategory === 'Tất cả' || p.category === activeCategory;
-    const matchSearch = searchQuery === '' ||
+    const matchSearch = searchQuery.trim() === '' ||
       p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       p.ingredients.toLowerCase().includes(searchQuery.toLowerCase()) ||
       p.description.toLowerCase().includes(searchQuery.toLowerCase());
-    return matchCategory && matchSearch;
-  });
+    return matchCategory && matchSearch && (!onlyAvailable || (p.inStock && p.stock > 0)) && (!onlyOffers || p.isPromo);
+  }).sort((a, b) => sortBy === 'price-asc' ? a.price - b.price : sortBy === 'price-desc' ? b.price - a.price : sortBy === 'name' ? a.name.localeCompare(b.name, 'vi') : 0);
 
   // Auth functions
   const handleRegister = (name: string, emailPhone: string, password: string) => {
+    name = name.trim();
+    emailPhone = emailPhone.trim().toLowerCase();
+    if (!name || password.length < 6) return { success: false, error: 'Nhập họ tên và mật khẩu tối thiểu 6 ký tự!' };
     const existingUsers = getFromStorage<User[]>('cocoon_users', []);
-    const isDuplicate = existingUsers.find(u => u.email === emailPhone || u.phone === emailPhone);
+    const isDuplicate = existingUsers.find(u => u.email.toLowerCase() === emailPhone || u.phone === emailPhone);
     if (isDuplicate) {
       return { success: false, error: 'Email/SĐT đã được sử dụng!' };
     }
@@ -123,9 +163,10 @@ export default function App() {
   };
 
   const handleLogin = (loginId: string, password: string) => {
+    loginId = loginId.trim();
     const allUsers = getFromStorage<User[]>('cocoon_users', []);
     const user = allUsers.find(u =>
-      (u.email === loginId || u.phone === loginId || u.name === loginId) && u.password === password
+      (u.email.toLowerCase() === loginId.toLowerCase() || u.phone === loginId || u.name === loginId) && u.password === password
     );
     if (user) {
       if (user.isLocked) {
@@ -146,11 +187,12 @@ export default function App() {
 
   // Cart functions
   const addToCart = (product: Product) => {
-    if (!product.inStock) {
+    if (!product.inStock || product.stock <= 0) {
       showToast('Sản phẩm đã hết hàng!', 'error');
       return;
     }
     const existing = cart.find(item => item.product.id === product.id);
+    if ((existing?.quantity || 0) >= product.stock) { showToast('Số lượng vượt quá tồn kho!', 'error'); return; }
     if (existing) {
       setCart(cart.map(item =>
         item.product.id === product.id ? { ...item, quantity: item.quantity + 1 } : item
@@ -162,6 +204,9 @@ export default function App() {
   };
 
   const updateCartQty = (productId: string, qty: number) => {
+    if (!Number.isInteger(qty)) return;
+    const product = products.find(p => p.id === productId);
+    if (qty > 0 && (!product || !product.inStock || qty > product.stock)) { showToast('Số lượng vượt quá tồn kho!', 'error'); return; }
     if (qty <= 0) {
       setCart(cart.filter(item => item.product.id !== productId));
     } else {
@@ -180,22 +225,16 @@ export default function App() {
   const cartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
 
   // Order functions
-  const placeOrder = (customerName: string, customerPhone: string, customerAddress: string, paymentMethod: string, couponDiscount: number) => {
-    const addressLower = customerAddress.toLowerCase();
-    let shippingFee = SHIPPING_FEE_MAP['default'];
-    if (addressLower.includes('hcm') || addressLower.includes('hồ chí minh') || addressLower.includes('sài gòn')) {
-      shippingFee = SHIPPING_FEE_MAP['hcm'];
-    } else if (addressLower.includes('hà nội') || addressLower.includes('hn')) {
-      shippingFee = SHIPPING_FEE_MAP['hn'];
-    } else if (addressLower.includes('đà nẵng') || addressLower.includes('danang')) {
-      shippingFee = SHIPPING_FEE_MAP['danang'];
-    }
-
-    if (cartTotal >= FREE_SHIPPING_THRESHOLD) {
-      shippingFee = 0;
-    }
-
-    const finalTotal = cartTotal - couponDiscount + shippingFee;
+  const placeOrder = (customerName: string, customerPhone: string, customerAddress: string, paymentMethod: string, couponCode: string, shippingCode: string): Order | null => {
+    if (orderInProgress.current) return null;
+    const account = users.find(u => u.id === currentUser?.id);
+    if (!account || account.isLocked) { showToast('Vui lòng đăng nhập bằng tài khoản đang hoạt động!', 'error'); return null; }
+    if (!cart.length || cart.some(item => {
+      const product = products.find(p => p.id === item.product.id);
+      return !product || !product.inStock || !Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > product.stock || item.product.price !== product.price;
+    })) { showToast('Giỏ hàng đã thay đổi hoặc vượt tồn kho. Vui lòng cập nhật lại giỏ!', 'error'); return null; }
+    orderInProgress.current = true;
+    const { shippingFee, couponDiscount, finalTotal } = calculateCheckoutTotals(cartTotal, customerAddress, couponCode, shippingCode);
 
     const newOrder: Order = {
       id: 'ORD-' + Date.now().toString(36).toUpperCase(),
@@ -214,10 +253,18 @@ export default function App() {
       createdAt: new Date().toLocaleString('vi-VN'),
     };
 
+    const updatedProducts = products.map(product => {
+      const quantity = cart.find(item => item.product.id === product.id)?.quantity || 0;
+      const stock = product.stock - quantity;
+      return quantity ? { ...product, stock, inStock: stock > 0 } : product;
+    });
+    setProducts(updatedProducts);
+    saveToStorage('cocoon_products', updatedProducts);
     const updatedOrders = [newOrder, ...orders];
     setOrders(updatedOrders);
     saveToStorage('cocoon_orders', updatedOrders);
     setCart([]);
+    setTimeout(() => { orderInProgress.current = false; }, 0);
     return newOrder;
   };
 
@@ -287,7 +334,7 @@ export default function App() {
 
   // Render
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="storefront min-h-screen">
       {/* Toast */}
       {toast && (
         <div className={`toast toast-${toast.type}`}>
@@ -295,20 +342,21 @@ export default function App() {
         </div>
       )}
 
+      <div className="announcement">Chăm chút làn da, nâng niu thiên nhiên <span>•</span> Freeship với mã <strong>FREESHIP</strong></div>
       {/* Header */}
-      <header className="header-gradient text-white shadow-lg sticky top-0 z-50">
+      <header className="store-header sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 py-3">
-          <div className="flex items-center justify-between">
+          <div className="header-row flex items-center justify-between">
             <div className="flex items-center gap-3 cursor-pointer" onClick={() => { setCurrentPage('home'); setShowCheckout(false); setShowOrderHistory(false); setShowAdmin(false); setShowUserProfile(false); }}>
-              <span className="text-3xl">🌿</span>
+              <span className="brand-symbol" aria-hidden="true">✳</span>
               <div>
-                <h1 className="text-xl font-bold font-playfair">COCOON</h1>
-                <p className="text-xs text-green-200">Mỹ phẩm thuần chay Việt Nam</p>
+                <h1 className="brand-wordmark">cocoon<span>ORIGINAL VIETNAM</span></h1>
+                
               </div>
             </div>
 
             {/* Search bar */}
-            <div className="hidden md:flex items-center flex-1 max-w-md mx-6">
+            <div className="desktop-search hidden md:flex items-center flex-1 max-w-md mx-6">
               <input
                 type="text"
                 id="search-input"
@@ -320,14 +368,14 @@ export default function App() {
               <button
                 id="btn-search"
                 className="bg-green-700 hover:bg-green-800 px-4 py-2 rounded-r-full transition"
-                onClick={() => {}}
+                onClick={goToCatalog}
               >
-                <i className="fas fa-search"></i>
+                <StoreIcon name="search" />
               </button>
             </div>
 
             {/* Nav buttons */}
-            <div className="flex items-center gap-2">
+            <div className="header-actions flex items-center gap-2">
               {currentUser ? (
                 <>
                   {currentUser.role === 'admin' && (
@@ -354,11 +402,12 @@ export default function App() {
                     <i className="fas fa-user mr-1"></i> {currentUser.name.split(' ').pop()}
                   </button>
                   <button
-                    id="btn-logout"
+                    aria-label="Đăng xuất"
+                      id="btn-logout"
                     className="px-3 py-2 text-sm bg-red-600 hover:bg-red-700 rounded-lg transition"
                     onClick={handleLogout}
                   >
-                    <i className="fas fa-sign-out-alt"></i>
+                      <StoreIcon name="logout" />
                   </button>
                 </>
               ) : (
@@ -371,11 +420,12 @@ export default function App() {
                 </button>
               )}
               <button
+                aria-label="Mở giỏ hàng"
                 id="btn-cart"
                 className="relative px-3 py-2 text-sm bg-green-700 hover:bg-green-800 rounded-lg transition"
                 onClick={() => setShowCart(true)}
               >
-                <i className="fas fa-shopping-cart"></i>
+                <StoreIcon name="cart" />
                 {cartCount > 0 && (
                   <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center">
                     {cartCount}
@@ -396,39 +446,53 @@ export default function App() {
               onChange={(e) => setSearchQuery(e.target.value)}
             />
             <button
+              onClick={goToCatalog}
               id="btn-search-mobile"
               className="bg-green-700 px-4 py-2 rounded-r-full"
             >
-              <i className="fas fa-search"></i>
+              <StoreIcon name="search" />
             </button>
           </div>
         </div>
+        <nav className="store-nav" aria-label="Danh mục cửa hàng">
+          <button onClick={() => { setOnlyOffers(false); setActiveCategory('Tất cả'); goToCatalog(); }}>Tất cả sản phẩm</button>
+          {CATEGORIES.map(category => <button key={category} onClick={() => { setOnlyOffers(false); setActiveCategory(category); goToCatalog(); }}>{category}</button>)}
+          <button onClick={() => { setOnlyOffers(true); setActiveCategory('Tất cả'); goToCatalog(); }}>Ưu đãi hôm nay <span className="nav-dot" /></button>
+          <button onClick={() => setInfoPanel('Câu chuyện nguyên liệu')}>Câu chuyện nguyên liệu</button>
+        </nav>
       </header>
 
       {/* Main Content */}
       {currentPage === 'home' && (
         <main>
-          {/* Hero Section */}
-          <section className="hero-section py-16 px-4">
-            <div className="max-w-7xl mx-auto text-center relative z-10">
-              <h2 className="text-4xl md:text-5xl font-bold text-green-900 font-playfair mb-4">
-                Đẹp Tự Nhiên Từ Thiên Nhiên
-              </h2>
-              <p className="text-lg text-green-700 mb-8 max-w-2xl mx-auto">
-                Cocoon - Thương hiệu mỹ phẩm thuần chay đầu tiên tại Việt Nam.
-                100% nguyên liệu từ thiên nhiên, không thử nghiệm trên động vật.
-              </p>
-              <div className="flex gap-4 justify-center flex-wrap">
-                <span className="vegan-badge text-sm px-4 py-2">🌱 100% Thuần chay</span>
-                <span className="bg-white/80 text-green-800 px-4 py-2 rounded-full text-sm font-semibold">🐰 Không thử nghiệm trên động vật</span>
-                <span className="bg-white/80 text-green-800 px-4 py-2 rounded-full text-sm font-semibold">🇻🇳 Nguyên liệu Việt Nam</span>
-              </div>
+          <section className="editorial-hero">
+            <div className="hero-copy">
+              <p className="eyebrow">VẺ ĐẸP TỪ NHỮNG ĐIỀU THUẦN KHIẾT</p>
+              <h2>Một chút thiên nhiên.<br /><em>Một làn da hạnh phúc.</em></h2>
+              <p className="hero-description">Dành cho bạn những phút chăm sóc dịu dàng mỗi ngày, bắt đầu từ những nguyên liệu thân quen của Việt Nam.</p>
+              <button className="btn-primary hero-cta" onClick={() => { setOnlyOffers(false); setActiveCategory('Tất cả'); goToCatalog(); }}>Khám phá sản phẩm <span aria-hidden="true">↗</span></button>
+              <div className="hero-caption"><span className="small-leaf">✳</span><span>Chăm sóc có ý thức.<br /><strong>Vẻ đẹp bền lâu.</strong></span></div>
+            </div>
+            <div className="hero-art" aria-label="Bộ sưu tập chăm sóc da từ nguyên liệu Việt Nam">
+              <span className="hero-orbit" />
+              <span className="hero-art-note">FROM VIETNAM,<br />WITH LOVE.</span>
+              <div className="hero-bottle back"><ProductVisual product={products.find(p => p.id === 'p4') || PRODUCTS[3]} /></div>
+              <div className="hero-bottle front"><ProductVisual product={products.find(p => p.id === 'p1') || PRODUCTS[0]} /></div>
+              <div className="hero-bottle side"><ProductVisual product={products.find(p => p.id === 'p2') || PRODUCTS[1]} /></div>
+              <svg className="botanical" viewBox="0 0 260 380" aria-hidden="true"><path d="M128 375Q95 200 173 10" fill="none" stroke="currentColor" strokeWidth="3" />{[0,1,2,3,4].map(i => <g key={i} transform={`translate(0 ${i*62})`}><path d="M134 84Q30 62 57 8Q128 3 134 84Z" fill="currentColor" /><path d="M138 82Q238 75 229 17Q161 11 138 82Z" fill="currentColor" /></g>)}</svg>
+              <div className="hero-art-footer"><span>NGUYÊN LIỆU VIỆT • CẢM HỨNG TỰ NHIÊN</span><span>CHĂM SÓC MỖI NGÀY</span></div>
             </div>
           </section>
+          <div className="service-strip">
+            <div><i className="fas fa-truck" /><span><strong>Giao hàng tận nơi</strong><small>Miễn phí từ {formatPrice(FREE_SHIPPING_THRESHOLD)}</small></span></div>
+            <div><i className="fas fa-tag" /><span><strong>Ưu đãi cho bạn</strong><small>Voucher giảm giá kết hợp mã freeship</small></span></div>
+            <div><i className="fas fa-seedling" /><span><strong>Chọn điều phù hợp</strong><small>Khám phá thành phần từng sản phẩm</small></span></div>
+          </div>
 
           {/* Category Filter */}
-          <section className="max-w-7xl mx-auto px-4 py-8">
-            <div className="flex flex-wrap gap-3 justify-center mb-8">
+          <section id="catalog" className="catalog-section max-w-7xl mx-auto px-4 py-8">
+            <div className="catalog-heading"><div><p className="eyebrow">CHĂM CHÚT BẢN THÂN MỖI NGÀY</p><h2>Tìm điều làn da bạn cần</h2></div><span className="catalog-note">Từ thiên nhiên Việt Nam<br />đến thói quen của bạn.</span></div>
+            <div className="category-tabs flex flex-wrap gap-3 mb-8">
               {['Tất cả', 'Chăm sóc da', 'Chăm sóc tóc', 'Chăm sóc cơ thể', 'Chăm sóc môi'].map(cat => (
                 <button
                   key={cat}
@@ -440,13 +504,15 @@ export default function App() {
               ))}
             </div>
 
+            <div className="catalog-toolbar"><span>{filteredProducts.length} sản phẩm{searchQuery && ` cho “${searchQuery}”`}{onlyOffers && ' đang ưu đãi'}</span><div><label className="stock-filter"><input type="checkbox" checked={onlyAvailable} onChange={e => setOnlyAvailable(e.target.checked)} /> Còn hàng</label><select id="product-sort" aria-label="Sắp xếp sản phẩm" value={sortBy} onChange={e => setSortBy(e.target.value)}><option value="featured">Đề xuất cho bạn</option><option value="price-asc">Giá tăng dần</option><option value="price-desc">Giá giảm dần</option><option value="name">Tên A–Z</option></select></div></div>
+            {onlyOffers && <button className="clear-filter" onClick={() => setOnlyOffers(false)}>Bỏ lọc ưu đãi ×</button>}
             {/* Products Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
               {filteredProducts.map(product => (
                 <div key={product.id} className="product-card" data-product-id={product.id}>
                   {/* Product Image */}
-                  <div className="relative bg-gradient-to-br from-green-50 to-emerald-50 p-8 flex items-center justify-center h-48">
-                    <span className="text-6xl">{product.image}</span>
+                  <div className="product-stage relative flex items-center justify-center">
+                    <button className="product-image-button" aria-label={`Xem chi tiết ${product.name}`} onClick={() => setShowProductDetail(product)}><ProductVisual product={product} /></button>
                     {/* Badges */}
                     <div className="absolute top-3 left-3 flex flex-col gap-1">
                       {product.isVegan && <span className="vegan-badge">100% Thuần chay</span>}
@@ -461,10 +527,7 @@ export default function App() {
                   {/* Product Info */}
                   <div className="p-4">
                     <p className="text-xs text-green-600 font-semibold mb-1">{product.category}</p>
-                    <h3 className="font-semibold text-gray-800 mb-1 cursor-pointer hover:text-green-700"
-                      onClick={() => setShowProductDetail(product)}>
-                      {product.name}
-                    </h3>
+                    <h3 className="product-name"><button onClick={() => setShowProductDetail(product)}>{product.name}</button></h3>
                     <p className="text-xs text-gray-500 mb-2">{product.volume}</p>
                     <div className="flex items-center gap-2 mb-3">
                       <span className="text-lg font-bold text-green-800">{formatPrice(product.price)}</span>
@@ -501,48 +564,18 @@ export default function App() {
             )}
           </section>
 
-          {/* Free shipping banner */}
-          <section className="bg-green-50 py-8 px-4 mt-8">
-            <div className="max-w-7xl mx-auto text-center">
-              <h3 className="text-2xl font-bold text-green-800 mb-2">🚚 Miễn phí vận chuyển</h3>
-              <p className="text-green-600">Cho đơn hàng từ {formatPrice(FREE_SHIPPING_THRESHOLD)}</p>
-            </div>
+          <section className="ingredient-story">
+            <div className="story-visual"><span>✳</span><p>Nuôi dưỡng làn da.<br /><em>Trân trọng thiên nhiên.</em></p></div>
+            <div className="story-copy"><p className="eyebrow">NHỮNG ĐIỀU NHỎ, ĐƯỢC CHỌN KỸ</p><h2>Một hành trình chăm sóc<br />bắt đầu từ nguyên liệu.</h2><p>Cà phê Đắk Lắk, bí đao, hoa hồng và vỏ bưởi. Những nguyên liệu gần gũi mang đến cảm hứng cho từng bước chăm sóc của bạn.</p><button className="text-link" onClick={() => setInfoPanel('Câu chuyện nguyên liệu')}>Khám phá câu chuyện <span>↗</span></button></div>
           </section>
-
-          {/* Footer */}
-          <footer className="bg-green-900 text-white py-12 px-4 mt-12">
-            <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-4 gap-8">
-              <div>
-                <h4 className="font-bold text-lg mb-3">🌿 COCOON</h4>
-                <p className="text-green-200 text-sm">Mỹ phẩm thuần chay Việt Nam. Đẹp tự nhiên từ thiên nhiên.</p>
-              </div>
-              <div>
-                <h4 className="font-bold mb-3">Liên hệ</h4>
-                <p className="text-green-200 text-sm">📞 1900 xxxx</p>
-                <p className="text-green-200 text-sm">📧 hello@cocoon.vn</p>
-                <p className="text-green-200 text-sm">📍 TP. Hồ Chí Minh, Việt Nam</p>
-              </div>
-              <div>
-                <h4 className="font-bold mb-3">Chính sách</h4>
-                <p className="text-green-200 text-sm">• Chính sách đổi trả</p>
-                <p className="text-green-200 text-sm">• Chính sách bảo mật</p>
-                <p className="text-green-200 text-sm">• Điều khoản sử dụng</p>
-              </div>
-              <div>
-                <h4 className="font-bold mb-3">Testing</h4>
-                <button
-                  id="btn-selenium-guide"
-                  className="text-green-200 text-sm hover:text-white transition flex items-center gap-2 bg-green-800 hover:bg-green-700 px-4 py-2 rounded-lg"
-                  onClick={() => setCurrentPage('selenium-guide')}
-                >
-                  <i className="fas fa-flask"></i> Hướng dẫn Selenium Test
-                </button>
-                <p className="text-green-300 text-xs mt-2">Xem locator & code mẫu</p>
-              </div>
-            </div>
-            <div className="max-w-7xl mx-auto mt-8 pt-6 border-t border-green-700 text-center text-green-300 text-sm">
-              © 2024 Cocoon Vietnam. All rights reserved.
-            </div>
+          <section className="offer-band"><div><p className="eyebrow">MỘT CHÚT ƯU ĐÃI CHO BẠN</p><h2>Yêu chiều bản thân, thêm phần trọn vẹn.</h2><p>Dùng voucher giảm giá cùng mã vận chuyển FREESHIP khi thanh toán.</p></div><button className="btn-primary" onClick={() => { setOnlyOffers(true); goToCatalog(); }}>Khám phá ưu đãi ↗</button></section>
+          <footer className="store-footer">
+            <div className="footer-grid">
+              <div><div className="footer-logo">cocoon<span>ORIGINAL VIETNAM</span></div><p>Vẻ đẹp bắt đầu từ sự chăm chút.<br />Cảm hứng từ thiên nhiên Việt Nam.</p><small>Website mô phỏng phục vụ học tập và kiểm thử.</small></div>
+              <div><h3>Khám phá</h3>{CATEGORIES.map(c => <button key={c} onClick={() => { setActiveCategory(c); setOnlyOffers(false); goToCatalog(); }}>{c}</button>)}</div>
+              <div><h3>Hỗ trợ mua hàng</h3>{['Hướng dẫn mua hàng', 'Giao hàng & đổi trả', 'Bảo mật thông tin'].map(title => <button key={title} onClick={() => setInfoPanel(title)}>{title}</button>)}</div>
+              <div><h3>Dành cho nhóm kiểm thử</h3><button id="btn-selenium-guide" onClick={() => setCurrentPage('selenium-guide')}>Hướng dẫn Selenium ↗</button><p>Tài khoản mẫu và các luồng mua hàng có sẵn để thực hành.</p></div>
+            </div><div className="footer-bottom"><span>© {new Date().getFullYear()} Cocoon · Bản demo học tập</span><span>Được chăm chút, từ những điều nhỏ.</span></div>
           </footer>
         </main>
       )}
@@ -607,6 +640,7 @@ export default function App() {
         </div>
       )}
 
+      {infoPanel && <div className="modal-overlay" role="presentation" onClick={e => e.target === e.currentTarget && setInfoPanel(null)}><section className="modal-content info-dialog" role="dialog" aria-modal="true" aria-labelledby="info-title"><button className="dialog-close" aria-label="Đóng" onClick={() => setInfoPanel(null)}>×</button><p className="eyebrow">COCOON • CHĂM SÓC MỖI NGÀY</p><h2 id="info-title">{infoPanel}</h2><p>{infoPanel === 'Câu chuyện nguyên liệu' ? 'Tìm hiểu cà phê, bí đao, hoa hồng và bưởi trong mục Thành phần của mỗi sản phẩm. Danh mục và bao bì trên website này là dữ liệu minh họa cho đồ án.' : infoPanel === 'Hướng dẫn mua hàng' ? 'Chọn sản phẩm, thêm vào giỏ, đăng nhập và điền thông tin nhận hàng. Bạn có thể dùng đồng thời một voucher giảm giá và một mã freeship. Xem lại đơn trong mục Đơn hàng.' : infoPanel === 'Giao hàng & đổi trả' ? 'Phí giao hàng được ước tính theo địa chỉ. Đơn từ 500.000đ hoặc dùng mã FREESHIP được miễn phí vận chuyển. Website hiện mô phỏng việc đặt hàng, chưa kết nối đơn vị giao hàng hay xử lý đổi trả thực tế.' : 'Tài khoản, giỏ hàng và đơn hàng của bản demo được lưu trong trình duyệt đang sử dụng. Dữ liệu chưa đồng bộ giữa thiết bị. Chỉ sử dụng thông tin giả lập cho các bài kiểm thử.'}</p></section></div>}
       {/* Auth Modal */}
       {showAuthModal && (
         <AuthModal
@@ -655,6 +689,22 @@ export default function App() {
       )}
     </div>
   );
+}
+
+
+function StoreIcon({ name }: { name: 'cart' | 'search' | 'logout' }) {
+  return <svg className="store-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{name === 'search' ? <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 4 4" /></> : name === 'cart' ? <><path d="M3 4h2l2 12h12l2-9H6M9 20h.01M18 20h.01" /><circle cx="9" cy="20" r="1" /><circle cx="18" cy="20" r="1" /></> : <><path d="M10 4H4v16h6M9 12h12m-4-4 4 4-4 4" /></>}</svg>;
+}
+
+function ProductVisual({ product }: { product: Product }) {
+  const [failedImage, setFailedImage] = useState('');
+  if (/^https?:\/\//i.test(product.image) && failedImage !== product.image) return <img className="product-photo" src={product.image} alt={product.name} loading="lazy" onError={() => setFailedImage(product.image)} />;
+  const index = Math.max(0, PRODUCTS.findIndex(p => p.id === product.id));
+  const shape = [0, 7].includes(index) ? 'jar' : index === 4 ? 'stick' : 'bottle';
+  const palettes = ['coffee', 'wintermelon', 'rose', 'pomelo', 'coconut', 'turmeric', 'pomelo', 'chamomile'];
+  return <div className={`product-illustration ${shape} tone-${palettes[index] || 'coffee'}`} role="img" aria-label={`Bao bì minh họa: ${product.name}`}>
+    <div className="package-cap" /><div className="package-body"><div className="package-label"><span className="package-origin">THE ORIGINAL VIETNAM</span><strong>cocoon</strong><span className="package-rule" /><span className="package-title">{product.name}</span><span className="package-volume">{product.volume}</span><span className="package-mark">✳</span></div></div>
+  </div>;
 }
 
 // ============== AUTH MODAL ==============
@@ -715,7 +765,7 @@ function AuthModal({ tab, setTab, onClose, onLogin, onRegister, showToast, setCu
       showToast('Vui lòng nhập email/SĐT!', 'error');
       return;
     }
-    showToast('Link khôi phục mật khẩu đã được gửi đến email của bạn!', 'info');
+    showToast('Bản demo chưa kết nối dịch vụ gửi email khôi phục mật khẩu.', 'info');
     setShowForgot(false);
   };
 
@@ -886,7 +936,7 @@ function CartModal({ cart, cartTotal, onUpdateQty, onRemove, onClose, onCheckout
             <div className="space-y-4">
               {cart.map(item => (
                 <div key={item.product.id} className="flex items-center gap-3 p-3 bg-gray-50 rounded-xl">
-                  <span className="text-3xl">{item.product.image}</span>
+                  <div className="cart-product-art"><ProductVisual product={item.product} /></div>
                   <div className="flex-1">
                     <h4 className="font-semibold text-sm text-gray-800">{item.product.name}</h4>
                     <p className="text-green-700 font-bold text-sm">{formatPrice(item.product.price)}</p>
@@ -952,7 +1002,7 @@ function ProductDetailModal({ product, onClose, onAddToCart }: {
       <div className="modal-content bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 overflow-hidden">
         <div className="flex flex-col md:flex-row">
           <div className="md:w-1/2 bg-gradient-to-br from-green-50 to-emerald-50 p-12 flex items-center justify-center relative">
-            <span className="text-8xl">{product.image}</span>
+            <ProductVisual product={product} />
             <div className="absolute top-4 left-4 flex flex-col gap-1">
               {product.isVegan && <span className="vegan-badge">100% Thuần chay</span>}
               {product.isPromo && <span className="promo-badge">Khuyến mãi</span>}
@@ -998,7 +1048,7 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
   cart: CartItem[];
   cartTotal: number;
   currentUser: User | null;
-  onPlaceOrder: (name: string, phone: string, address: string, payment: string, couponDiscount: number) => Order;
+  onPlaceOrder: (name: string, phone: string, address: string, payment: string, couponCode: string, shippingCode: string) => Order | null;
   onBack: () => void;
   showToast: (msg: string, type?: string) => void;
 }) {
@@ -1007,44 +1057,71 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
   const [address, setAddress] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('cod');
   const [couponInput, setCouponInput] = useState('');
-  const [couponDiscount, setCouponDiscount] = useState(0);
+  const [appliedCoupon, setAppliedCoupon] = useState('');
+  const [shippingInput, setShippingInput] = useState('');
+  const [appliedShipping, setAppliedShipping] = useState('');
   const [orderSuccess, setOrderSuccess] = useState<Order | null>(null);
 
-  const addressLower = address.toLowerCase();
-  let shippingFee = SHIPPING_FEE_MAP['default'];
-  if (addressLower.includes('hcm') || addressLower.includes('hồ chí minh') || addressLower.includes('sài gòn')) {
-    shippingFee = SHIPPING_FEE_MAP['hcm'];
-  } else if (addressLower.includes('hà nội') || addressLower.includes('hn')) {
-    shippingFee = SHIPPING_FEE_MAP['hn'];
-  } else if (addressLower.includes('đà nẵng') || addressLower.includes('danang')) {
-    shippingFee = SHIPPING_FEE_MAP['danang'];
-  }
-  if (cartTotal >= FREE_SHIPPING_THRESHOLD) shippingFee = 0;
-
-  const finalTotal = Math.max(0, cartTotal - couponDiscount + shippingFee);
+  const { shippingFee, couponDiscount, finalTotal, appliedCouponCode, appliedShippingCode } = calculateCheckoutTotals(cartTotal, address, appliedCoupon, appliedShipping);
 
   const handleApplyCoupon = () => {
-    const coupon = COUPONS.find(c => c.code === couponInput.toUpperCase());
+    const code = couponInput.trim().toUpperCase();
+    const coupon = COUPONS.find(c => c.code === code);
     if (!coupon) {
       showToast('Mã giảm giá không hợp lệ!', 'error');
+      return;
+    }
+    if (cart.length === 0 || cartTotal <= 0) {
+      showToast('Vui lòng thêm sản phẩm vào giỏ hàng!', 'error');
       return;
     }
     if (cartTotal < coupon.minOrder) {
       showToast(`Đơn hàng tối thiểu ${formatPrice(coupon.minOrder)} để áp dụng mã này!`, 'error');
       return;
     }
-    const discount = Math.round(cartTotal * coupon.discount / 100);
-    setCouponDiscount(discount);
-    showToast(`Áp dụng mã ${coupon.code} giảm ${coupon.discount}%!`, 'success');
+    setAppliedCoupon(code);
+    setCouponInput(code);
+    showToast(`Áp dụng voucher ${code} giảm ${coupon.discount}%!`, 'success');
+  };
+
+  const handleApplyShipping = () => {
+    const code = shippingInput.trim().toUpperCase();
+    if (code !== FREESHIP_COUPON.code) {
+      showToast('Mã miễn phí vận chuyển không hợp lệ!', 'error');
+      return;
+    }
+    if (cart.length === 0 || cartTotal <= 0) {
+      showToast('Vui lòng thêm sản phẩm vào giỏ hàng!', 'error');
+      return;
+    }
+    if (cartTotal < FREESHIP_COUPON.minOrder) {
+      showToast(`Đơn hàng tối thiểu ${formatPrice(FREESHIP_COUPON.minOrder)} để dùng mã freeship!`, 'error');
+      return;
+    }
+    setAppliedShipping(code);
+    setShippingInput(code);
+    showToast('Đã áp dụng FREESHIP: miễn phí vận chuyển!', 'success');
   };
 
   const handleSubmitOrder = () => {
+    if (cart.length === 0 || cartTotal <= 0) {
+      showToast('Vui lòng thêm sản phẩm vào giỏ hàng!', 'error');
+      return;
+    }
+    if (name.trim().length < 2 || address.trim().length < 10) {
+      showToast('Nhập họ tên và địa chỉ giao hàng đầy đủ (tối thiểu 10 ký tự)!', 'error');
+      return;
+    }
+    if (!/^(0|\+84)[0-9]{9}$/.test(phone.trim())) {
+      showToast('Số điện thoại chưa đúng định dạng Việt Nam!', 'error');
+      return;
+    }
     if (!name || !phone || !address) {
       showToast('Vui lòng điền đầy đủ thông tin giao hàng!', 'error');
       return;
     }
-    const order = onPlaceOrder(name, phone, address, paymentMethod, couponDiscount);
-    setOrderSuccess(order);
+    const order = onPlaceOrder(name, phone, address, paymentMethod, appliedCouponCode, appliedShippingCode);
+    if (order) setOrderSuccess(order);
   };
 
   if (orderSuccess) {
@@ -1058,7 +1135,7 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
           </p>
           <div className="bg-gray-50 rounded-xl p-4 text-left mb-6">
             <p className="text-sm text-gray-600">Tổng tiền: <strong>{formatPrice(orderSuccess.finalTotal)}</strong></p>
-            <p className="text-sm text-gray-600">Thanh toán: <strong>{orderSuccess.paymentMethod === 'cod' ? 'COD (Thanh toán khi nhận hàng)' : 'Online (VNPay/MoMo)'}</strong></p>
+            <p className="text-sm text-gray-600">Thanh toán: <strong>{orderSuccess.paymentMethod === 'cod' ? 'COD (Thanh toán khi nhận hàng)' : 'Online — mô phỏng, chưa thu tiền'}</strong></p>
             <p className="text-sm text-gray-600">Trạng thái: <span className="status-pending">Chờ xử lý</span></p>
           </div>
           <button className="btn-primary" onClick={onBack}>
@@ -1074,7 +1151,7 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
       <button onClick={onBack} className="text-green-700 hover:text-green-900 mb-6 font-medium">
         <i className="fas fa-arrow-left mr-2"></i> Quay lại
       </button>
-      <h2 className="text-2xl font-bold text-gray-800 mb-6">Thanh toán & Đặt hàng</h2>
+      <div className="checkout-heading"><p className="eyebrow">THÊM MỘT CHÚT CHĂM SÓC CHO BẠN</p><h2>Hoàn tất đơn hàng</h2><div className="checkout-steps"><span>01 Giỏ hàng</span><strong>02 Thông tin & ưu đãi</strong><span>03 Hoàn tất</span></div></div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left: Form */}
@@ -1100,12 +1177,13 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
 
           {/* Coupon */}
           <div className="bg-white rounded-xl shadow-sm p-6">
-            <h3 className="font-bold text-gray-800 mb-4"><i className="fas fa-tag mr-2 text-green-600"></i> Mã giảm giá</h3>
+            <h3 className="font-bold text-gray-800 mb-4"><i className="fas fa-tag mr-2 text-green-600"></i> Voucher giảm giá</h3>
             <div className="flex gap-2">
               <input
                 type="text"
+                aria-label="Voucher giảm giá"
                 id="coupon-input"
-                placeholder="Nhập mã giảm giá (VD: COCOON10)"
+                placeholder="Nhập mã voucher (VD: COCOON10)"
                 value={couponInput}
                 onChange={(e) => setCouponInput(e.target.value)}
                 className="flex-1"
@@ -1115,11 +1193,42 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
               </button>
             </div>
             <p className="text-xs text-gray-400 mt-2">Thử: COCOON10, VEGAN20, NEWUSER</p>
+            {appliedCouponCode && (
+              <div id="applied-coupon" className="flex items-center justify-between gap-2 mt-3 text-sm text-green-700" role="status">
+                <span>Đang áp dụng: <strong>{appliedCouponCode}</strong></span>
+                <button id="btn-remove-coupon" type="button" className="underline" onClick={() => { setAppliedCoupon(''); setCouponInput(''); }}>Gỡ mã</button>
+              </div>
+            )}
+          </div>
+
+          {/* Shipping voucher is independent of the product discount. */}
+          <div id="shipping-voucher-section" className="bg-white rounded-xl shadow-sm p-6">
+            <h3 className="font-bold text-gray-800 mb-4"><i className="fas fa-truck mr-2 text-green-600"></i> Mã miễn phí vận chuyển</h3>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                id="shipping-coupon-input"
+                aria-label="Mã miễn phí vận chuyển"
+                placeholder="Nhập mã freeship (VD: FREESHIP)"
+                value={shippingInput}
+                onChange={(e) => setShippingInput(e.target.value)}
+                className="flex-1"
+              />
+              <button id="btn-apply-shipping-coupon" className="btn-secondary whitespace-nowrap" onClick={handleApplyShipping}>Áp dụng</button>
+            </div>
+            <p className="text-xs text-gray-500 mt-2">FREESHIP: miễn phí vận chuyển, không yêu cầu giá trị đơn tối thiểu. Dùng cùng một voucher giảm giá.</p>
+            {appliedShippingCode && (
+              <div id="applied-shipping-coupon" className="flex items-center justify-between gap-2 mt-3 text-sm text-green-700" role="status">
+                <span>Đang áp dụng: <strong>{appliedShippingCode}</strong></span>
+                <button id="btn-remove-shipping-coupon" type="button" className="underline" onClick={() => { setAppliedShipping(''); setShippingInput(''); }}>Gỡ mã freeship</button>
+              </div>
+            )}
           </div>
 
           {/* Payment */}
           <div className="bg-white rounded-xl shadow-sm p-6">
             <h3 className="font-bold text-gray-800 mb-4"><i className="fas fa-credit-card mr-2 text-green-600"></i> Phương thức thanh toán</h3>
+            <p className="text-xs text-gray-500 mb-4">Đơn hàng phục vụ kiểm thử. VNPay và MoMo chưa kết nối cổng thanh toán thực tế.</p>
             <div className="space-y-3">
               <label className="flex items-center gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
                 <input type="radio" name="payment-method" value="cod" checked={paymentMethod === 'cod'} onChange={(e) => setPaymentMethod(e.target.value)} />
@@ -1127,11 +1236,11 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
               </label>
               <label className="flex items-center gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
                 <input type="radio" name="payment-method" value="vnpay" checked={paymentMethod === 'vnpay'} onChange={(e) => setPaymentMethod(e.target.value)} />
-                <span className="font-medium">🏦 VNPay - Thanh toán online</span>
+                <span className="font-medium">VNPay — mô phỏng, chưa thu tiền</span>
               </label>
               <label className="flex items-center gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
                 <input type="radio" name="payment-method" value="momo" checked={paymentMethod === 'momo'} onChange={(e) => setPaymentMethod(e.target.value)} />
-                <span className="font-medium">📱 MoMo - Ví điện tử</span>
+                <span className="font-medium">MoMo — mô phỏng, chưa thu tiền</span>
               </label>
             </div>
           </div>
@@ -1144,7 +1253,7 @@ function CheckoutPage({ cart, cartTotal, currentUser, onPlaceOrder, onBack, show
             <div className="space-y-3 mb-4 max-h-60 overflow-y-auto">
               {cart.map(item => (
                 <div key={item.product.id} className="flex items-center gap-2 text-sm">
-                  <span className="text-xl">{item.product.image}</span>
+                  <div className="summary-product-art"><ProductVisual product={item.product} /></div>
                   <div className="flex-1">
                     <p className="font-medium text-gray-700 text-xs">{item.product.name}</p>
                     <p className="text-gray-500 text-xs">x{item.quantity}</p>
@@ -1220,7 +1329,7 @@ function OrderHistoryPage({ orders, onBack }: {
               </div>
               <div className="space-y-1 text-sm text-gray-600">
                 {order.items.map(item => (
-                  <p key={item.product.id}>{item.product.image} {item.product.name} x{item.quantity}</p>
+                  <p key={item.product.id}>{item.product.name} x{item.quantity}</p>
                 ))}
               </div>
               <div className="mt-3 pt-3 border-t flex justify-between items-center">
@@ -1399,7 +1508,7 @@ function AdminPanel({ orders, users, products, onUpdateOrderStatus, onAddProduct
                 </div>
                 <div className="text-sm text-gray-600 mb-3">
                   {order.items.map(item => (
-                    <span key={item.product.id} className="inline-block mr-3">{item.product.image} {item.product.name} x{item.quantity}</span>
+                    <span key={item.product.id} className="inline-block mr-3">{item.product.name} x{item.quantity}</span>
                   ))}
                 </div>
                 <div className="flex items-center gap-3">
@@ -1470,7 +1579,7 @@ function AdminPanel({ orders, users, products, onUpdateOrderStatus, onAddProduct
                     adminFilteredProducts.map(p => (
                       <tr key={p.id} className="border-t hover:bg-gray-50" data-product-row={p.id}>
                         <td className="p-3 font-mono text-xs text-gray-500">{p.id}</td>
-                        <td className="p-3 text-2xl">{p.image}</td>
+                        <td className="p-3"><div className="summary-product-art"><ProductVisual product={p} /></div></td>
                         <td className="p-3 font-medium text-gray-800">{p.name}</td>
                         <td className="p-3 text-gray-600">{p.category}</td>
                         <td className="p-3 font-semibold text-green-700">{formatPrice(p.price)}</td>
@@ -1527,8 +1636,8 @@ function AdminPanel({ orders, users, products, onUpdateOrderStatus, onAddProduct
                       <input type="text" id="product-form-id" value={editingProduct?.id || 'Tự động'} disabled className="bg-gray-100" />
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Hình ảnh (emoji)</label>
-                      <input type="text" id="product-form-image" value={productForm.image} onChange={(e) => setProductForm({...productForm, image: e.target.value})} placeholder="🌿" />
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Hình ảnh (URL hoặc emoji cũ)</label>
+                      <input type="text" id="product-form-image" value={productForm.image} onChange={(e) => setProductForm({...productForm, image: e.target.value})} placeholder="https://.../san-pham.jpg" />
                     </div>
                   </div>
                   <div>
